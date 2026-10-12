@@ -2,7 +2,7 @@
 //! smart objects, locks and label colors.
 
 use photocraft_color::{Color, ColorMode};
-use photocraft_doc::{BlendIf, BlendRange, Fill, GradientStyle, LabelColor, Locks};
+use photocraft_doc::{AdvancedBlending, BlendIf, BlendRange, Fill, GradientStyle, Knockout, LabelColor, Locks};
 use photocraft_geom::Affine;
 use photocraft_psd::descriptor::{Descriptor, Id, UnicodeString, Value, VersionedDescriptor};
 use photocraft_psd::layer::BlendingRanges;
@@ -16,6 +16,60 @@ pub fn parse_brst(data: &[u8]) -> u32 {
 /// Inverse of [`parse_brst`]; `None` when every channel blends (no block).
 pub fn brst_data(mask: u32) -> Option<Vec<u8>> {
     (mask != 0).then(|| (0..32u32).filter(|i| mask & 1 << i != 0).flat_map(u32::to_be_bytes).collect())
+}
+
+/// The Advanced Blending blocks, as (key, value for `a`, Photoshop's default value): `knko`
+/// (0 none, 1 shallow, 2 deep), `infx`, `clbl`, `tsly`, `lmgm`, `vmgm`. Each is stored as one
+/// byte followed by three bytes of padding (Adobe PSD spec, "Additional Layer Information").
+pub fn advanced_flags(a: &AdvancedBlending) -> [([u8; 4], u8, u8); 6] {
+    [
+        (*b"knko", a.knockout.to_psd(), 0),
+        (*b"infx", u8::from(a.blend_interior), 0),
+        (*b"clbl", u8::from(a.blend_clipped), 1),
+        (*b"tsly", u8::from(a.transparency_shapes), 1),
+        (*b"lmgm", u8::from(a.layer_mask_hides_effects), 0),
+        (*b"vmgm", u8::from(a.vector_mask_hides_effects), 0),
+    ]
+}
+
+/// Advanced Blending from a layer record's blocks (`block(key)` gives a block's data). A missing
+/// or empty block keeps Photoshop's default.
+pub fn advanced_from_blocks<'a>(block: impl Fn(&[u8; 4]) -> Option<&'a [u8]>) -> AdvancedBlending {
+    let mut a = AdvancedBlending::default();
+    let flag = |k: &[u8; 4]| block(k).and_then(|d| d.first().copied());
+    if let Some(v) = flag(b"knko") {
+        a.knockout = Knockout::from_psd(v);
+    }
+    let set = |k: &[u8; 4], f: &mut bool| {
+        if let Some(v) = flag(k) {
+            *f = v != 0;
+        }
+    };
+    set(b"infx", &mut a.blend_interior);
+    set(b"clbl", &mut a.blend_clipped);
+    set(b"tsly", &mut a.transparency_shapes);
+    set(b"lmgm", &mut a.layer_mask_hides_effects);
+    set(b"vmgm", &mut a.vector_mask_hides_effects);
+    a
+}
+
+/// Writes the Advanced Blending blocks into an exported layer's preserved block list: a block
+/// already there is rewritten in place (keeping Photoshop's block order); a missing one is added
+/// only when its value differs from the default, so plain layers gain no blocks.
+pub fn put_advanced(a: &AdvancedBlending, raw: &mut Vec<([u8; 4], Vec<u8>)>) {
+    for (key, v, default) in advanced_flags(a) {
+        match raw.iter_mut().find(|(k, _)| *k == key) {
+            Some(e) => {
+                // Keep any extra bytes a reader wrote; the flag is the first byte.
+                if e.1.len() < 4 {
+                    e.1.resize(4, 0);
+                }
+                e.1[0] = v;
+            }
+            None if v != default => raw.push((key, vec![v, 0, 0, 0])),
+            None => {}
+        }
+    }
 }
 
 /// Layer-record blending ranges (Adobe PSD spec, "Layer blending ranges data": the composite
@@ -46,15 +100,16 @@ pub fn ranges_from_blend_if(b: &BlendIf, channels: usize) -> BlendingRanges {
 }
 
 /// `lspf` bits (Adobe spec: bit 0 transparency, 1 composite, 2 position).
-/// Artboard (bit 3... here `0x10` as observed by ag-psd) and "all" (bit 31)
-/// are undocumented.
+/// Artboard (bit 3, `0x08`, as reference files write it) and "all" (bit 31) are undocumented.
+/// Older PhotoCraft builds wrote the artboard lock at bit 4 (`0x10`); that value is still
+/// accepted on read so those files keep their lock, and is rewritten at `0x08`.
 pub fn locks_from_lspf(v: u32) -> Locks {
-    Locks { transparency: v & 1 != 0, pixels: v & 2 != 0, position: v & 4 != 0, artboard: v & 0x10 != 0, all: v & 0x8000_0000 != 0 }
+    Locks { transparency: v & 1 != 0, pixels: v & 2 != 0, position: v & 4 != 0, artboard: v & 0x08 != 0 || v & 0x10 != 0, all: v & 0x8000_0000 != 0 }
 }
 
 /// Inverse of [`locks_from_lspf`].
 pub fn lspf_from_locks(l: &Locks) -> u32 {
-    u32::from(l.transparency) | u32::from(l.pixels) << 1 | u32::from(l.position) << 2 | u32::from(l.artboard) << 4 | u32::from(l.all) << 31
+    u32::from(l.transparency) | u32::from(l.pixels) << 1 | u32::from(l.position) << 2 | u32::from(l.artboard) << 3 | u32::from(l.all) << 31
 }
 
 /// `lclr` index → label.
@@ -67,6 +122,11 @@ pub fn label_from_index(v: u16) -> LabelColor {
         5 => LabelColor::Blue,
         6 => LabelColor::Violet,
         7 => LabelColor::Gray,
+        // Photoshop 2024 added these without renumbering the original labels.
+        8 => LabelColor::Seafoam,
+        9 => LabelColor::Indigo,
+        10 => LabelColor::Magenta,
+        11 => LabelColor::Fuchsia,
         _ => LabelColor::None,
     }
 }
@@ -82,6 +142,10 @@ pub fn label_index(l: LabelColor) -> u16 {
         LabelColor::Blue => 5,
         LabelColor::Violet => 6,
         LabelColor::Gray => 7,
+        LabelColor::Seafoam => 8,
+        LabelColor::Indigo => 9,
+        LabelColor::Magenta => 10,
+        LabelColor::Fuchsia => 11,
     }
 }
 
@@ -150,6 +214,13 @@ pub(crate) fn enum_of<'a>(d: &'a Descriptor, key: &str) -> Option<&'a [u8]> {
     }
 }
 
+/// A gradient's interpolation method code. Photoshop (27.11, checked by saving gradient fill
+/// layers) stores it as the enum `gradientsInterpolationMethod` (`Perc`, `Lnr `, `Smoo`, `Gcls`);
+/// `gs99` is kept as a fallback.
+pub(crate) fn gradient_method(d: &Descriptor) -> Option<&[u8]> {
+    enum_of(d, "gradientsInterpolationMethod").or_else(|| enum_of(d, "gs99"))
+}
+
 pub(crate) fn bool_of(d: &Descriptor, key: &str) -> bool {
     matches!(d.get(key), Some(Value::Boolean(true)))
 }
@@ -181,7 +252,7 @@ pub(crate) fn gradient_style_value(s: GradientStyle) -> Value {
 pub(crate) type Stops = (Vec<(f32, Color)>, Vec<(f32, f32)>);
 
 /// Stops of a `Grdn` descriptor, baked to Photoshop's interpolation (smoothness `Intr`, stop
-/// midpoints, and the parent's `gs99` interpolation method when given).
+/// midpoints, and the parent's interpolation method when given, see [`gradient_method`]).
 pub(crate) fn gradient_stops_with(grad: &Descriptor, method: Option<&[u8]>) -> Stops {
     let raw = gradient_stops_raw(grad);
     let stops = if raw.stops.len() >= 2 {
@@ -342,7 +413,7 @@ pub fn fill_from_desc(key: &[u8; 4], d: &Descriptor) -> Option<Fill> {
         b"GdFl" => {
             let angle = num(d.get("Angl")).unwrap_or(90.0) as f32;
             let scale = num(d.get("Scl ")).map_or(1.0, |v| v as f32 / 100.0);
-            let raw = get_desc(d, "Grad").map(|g| gradient_stops_editable(g, enum_of(d, "gs99")));
+            let raw = get_desc(d, "Grad").map(|g| gradient_stops_editable(g, gradient_method(d)));
             let (mut stops, midpoints) = raw.map(|r| (r.stops, r.mids)).unwrap_or_default();
             // Opacity stops with Photoshop's smoothness and opacity midpoints applied (raw when
             // the interpolation is plain); none when fully opaque.
@@ -511,6 +582,22 @@ pub(crate) fn parse_prefix_versioned(data: &[u8]) -> Option<Descriptor> {
     VersionedDescriptor::parse_prefix(data).ok().map(|(v, _)| v.descriptor)
 }
 
+/// The source-space box Photoshop maps onto a placed layer's `Trnf` quad: the bounding box of a
+/// single-patch custom warp's 16 control points, which may spill past the source, else the source
+/// rect `0..w × 0..h`. Mapping the source rect instead counts the overhang twice and stretches the
+/// placement. A degenerate or non-finite box falls back to the source rect.
+pub(crate) fn placed_frame(warp: Option<&photocraft_geom::warp::Warp>, w: f64, h: f64) -> [f64; 4] {
+    let rect = [0.0, 0.0, w, h];
+    let Some(m) = warp.filter(|wp| wp.style == photocraft_geom::warp::WarpStyle::Custom).and_then(|wp| wp.mesh.as_ref()).filter(|m| m.points.len() == 16)
+    else {
+        return rect;
+    };
+    let inf = f64::INFINITY;
+    let b = m.points.iter().fold([inf, inf, -inf, -inf], |b, [x, y]| [b[0].min(*x), b[1].min(*y), b[2].max(*x), b[3].max(*y)]);
+    let ok = b.iter().all(|v| v.is_finite()) && b[2] - b[0] > 1e-9 && b[3] - b[1] > 1e-9;
+    if ok { b } else { rect }
+}
+
 /// Smart object identifier and transform from `SoLd`/`PlLd` (best effort).
 pub fn parse_smart(key: &[u8; 4], data: &[u8]) -> (String, Affine) {
     // SoLd: 'soLD' + version(4) + versioned descriptor.
@@ -525,10 +612,38 @@ pub fn parse_smart(key: &[u8; 4], data: &[u8]) -> (String, Affine) {
         let p: Vec<f64> = pts.iter().filter_map(|v| num(Some(v))).collect();
         let (w, h) = (num(sz.get("Wdth")).unwrap_or(0.0), num(sz.get("Hght")).unwrap_or(0.0));
         if p.len() == 8 && w > 0.0 && h > 0.0 {
-            affine = Affine { m: [(p[2] - p[0]) / w, (p[3] - p[1]) / w, (p[6] - p[0]) / h, (p[7] - p[1]) / h, p[0], p[1]] };
+            let [x0, y0, x1, y1] = placed_frame(parse_placed_warp(key, data).as_ref(), w, h);
+            let (bw, bh) = (x1 - x0, y1 - y0);
+            let (a, b, c, d) = ((p[2] - p[0]) / bw, (p[3] - p[1]) / bw, (p[6] - p[0]) / bh, (p[7] - p[1]) / bh);
+            affine = Affine { m: [a, b, c, d, p[0] - a * x0 - c * y0, p[1] - b * x0 - d * y0] };
         }
     }
     (id, affine)
+}
+
+/// The projective placement of a `SoLd` / `SoLE` block whose corners aren't a parallelogram
+/// (Distort, Perspective): source pixels → document pixels, row-major 3×3. Read from
+/// `nonAffineTransform` (the placed corners), else `Trnf`. `None` for affine placements, which
+/// [`parse_smart`]'s affine holds exactly.
+pub fn parse_smart_perspective(key: &[u8; 4], data: &[u8]) -> Option<[f64; 9]> {
+    if key != b"SoLd" && key != b"SoLE" {
+        return None;
+    }
+    let d = data.get(8..).and_then(parse_prefix_versioned)?;
+    let sz = get_desc(&d, "Sz  ")?;
+    let (w, h) = (num(sz.get("Wdth"))?, num(sz.get("Hght"))?);
+    let quad = |key: &str| -> Option<[[f64; 2]; 4]> {
+        let Some(Value::List(pts)) = d.get(key) else { return None };
+        let p: Vec<f64> = pts.iter().filter_map(|v| num(Some(v))).collect();
+        (p.len() == 8 && p.iter().all(|v| v.is_finite())).then(|| [[p[0], p[1]], [p[2], p[3]], [p[4], p[5]], [p[6], p[7]]])
+    };
+    let q = quad("nonAffineTransform").or_else(|| quad("Trnf"))?;
+    // A parallelogram (top-left + bottom-right = top-right + bottom-left) is affine.
+    let tol = 1e-6 * (1.0 + q.iter().flatten().fold(0.0f64, |m, v| m.max(v.abs())));
+    if (0..2).all(|i| (q[0][i] + q[2][i] - q[1][i] - q[3][i]).abs() <= tol) || w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    photocraft_algo::transform::Homography::rect_to_quad([0.0, 0.0, w, h], q).map(|m| m.0)
 }
 
 /// `masterFXSwitch` from an `lfx2` block (defaults to `true`).
@@ -565,6 +680,31 @@ mod tests {
         let (k, data) = super::write_fill(&Fill::gradient(vec![(0.0, red), (1.0, Color::WHITE)], 0.0, 1.0, GradientStyle::Linear, false));
         let Some(Fill::Gradient { opacity_stops, .. }) = super::parse_fill(&k, &data) else { panic!("gradient") };
         assert!(opacity_stops.is_empty());
+    }
+
+    /// Photoshop 27.11 stores a gradient's method as the enum `gradientsInterpolationMethod`
+    /// (seen in gradient fill layers saved by scripted Photoshop): a black→white Linear gradient
+    /// is at 188 of 255 halfway (measured), where Classic gives 128. The key used to be read as
+    /// `gs99`, which Photoshop doesn't write, so every gradient opened as Classic.
+    #[test]
+    fn gradient_fill_reads_the_interpolation_method() {
+        use photocraft_color::Color;
+        use photocraft_doc::{Fill, GradientStyle};
+        use photocraft_psd::descriptor::{Id, Value};
+        let f = Fill::gradient(vec![(0.0, Color::BLACK), (1.0, Color::WHITE)], 0.0, 1.0, GradientStyle::Linear, false);
+        let (k, data) = super::write_fill(&f);
+        let d = super::parse_prefix_versioned(&data).unwrap();
+        let mid = |code: &str| {
+            let d =
+                d.clone().with("gradientsInterpolationMethod", Value::Enumerated { type_id: Id::new("gradientInterpolationMethodType"), value: Id::new(code) });
+            let back = super::fill_from_desc(&k, &d).unwrap();
+            let ramp = photocraft_compose::gradient_fill::Ramp::new(&back).unwrap();
+            (ramp.sample(0.5)[0] * 255.0).round()
+        };
+        assert_eq!(mid("Gcls"), 128.0);
+        assert!((mid("Lnr ") - 188.0).abs() <= 1.0, "Linear: {}", mid("Lnr "));
+        assert!((mid("Perc") - 99.0).abs() <= 2.0, "Perceptual: {}", mid("Perc"));
+        assert!((mid("Smoo") - 99.0).abs() <= 2.0, "Smooth: {}", mid("Smoo"));
     }
 
     #[test]
@@ -609,6 +749,37 @@ mod tests {
         assert_eq!(r.data.len(), 4 * 8);
         assert_eq!(&r.data[..8], &[5, 5, 255, 255, 0, 0, 255, 255]);
         assert_eq!(&r.data[8..], &BlendingRanges::full(2).data[..]);
+    }
+
+    #[test]
+    fn advanced_blending_blocks_round_trip() {
+        use photocraft_doc::{AdvancedBlending, Knockout};
+        let a = AdvancedBlending {
+            knockout: Knockout::Deep,
+            blend_interior: true,
+            blend_clipped: false,
+            transparency_shapes: false,
+            layer_mask_hides_effects: true,
+            vector_mask_hides_effects: true,
+        };
+        let mut raw = Vec::new();
+        super::put_advanced(&a, &mut raw);
+        assert_eq!(raw.len(), 6);
+        assert!(raw.contains(&(*b"knko", vec![2, 0, 0, 0])));
+        assert!(raw.contains(&(*b"clbl", vec![0, 0, 0, 0])));
+        let get = |k: &[u8; 4]| raw.iter().find(|(bk, _)| bk == k).map(|(_, d)| d.as_slice());
+        assert_eq!(super::advanced_from_blocks(get), a);
+        // Defaults: nothing added to a plain layer; existing blocks rewritten in place, in order.
+        let mut plain = Vec::new();
+        super::put_advanced(&AdvancedBlending::default(), &mut plain);
+        assert!(plain.is_empty());
+        let mut kept = vec![(*b"luni", vec![0; 4]), (*b"knko", vec![1, 0, 0, 0]), (*b"clbl", vec![1])];
+        super::put_advanced(&AdvancedBlending::default(), &mut kept);
+        assert_eq!(kept, vec![(*b"luni", vec![0; 4]), (*b"knko", vec![0, 0, 0, 0]), (*b"clbl", vec![1, 0, 0, 0])]);
+        // Missing and empty blocks read as Photoshop's defaults.
+        assert!(super::advanced_from_blocks(|_| None).is_default());
+        assert!(super::advanced_from_blocks(|_| Some(&[][..])).is_default());
+        assert_eq!(super::advanced_from_blocks(|k| (k == b"knko").then_some(&[1u8][..])).knockout, Knockout::Shallow);
     }
 
     #[test]
@@ -668,9 +839,15 @@ mod tests {
 
     #[test]
     fn locks_and_labels() {
-        for bits in [0u32, 1, 2, 4, 0x10, 0x8000_0000, 0x8000_0017] {
+        // Reference values round-trip byte for byte; Background layers carry 0x0D
+        // (transparency + position + the bit-3 lock reference files write).
+        for bits in [0u32, 1, 2, 4, 8, 0x0D, 0x8000_0000, 0x8000_000F] {
             assert_eq!(lspf_from_locks(&locks_from_lspf(bits)), bits);
         }
+        // Older PhotoCraft files wrote the artboard lock at 0x10; it reads back as artboard
+        // and is rewritten at the reference value 0x08.
+        assert!(locks_from_lspf(0x10).artboard);
+        assert_eq!(lspf_from_locks(&locks_from_lspf(0x10)), 0x08);
         for i in 0..8 {
             assert_eq!(label_index(label_from_index(i)), i);
         }
@@ -739,6 +916,63 @@ mod more_tests {
         assert_eq!(id, "uuid-1");
         assert_eq!(a.m, [2.0, 0.0, 0.0, 2.0, 10.0, 20.0]);
         assert_eq!(parse_smart(b"PlLd", &data).0, "");
+    }
+
+    /// `SoLd` data with a 50 × 25 source, the quad `trnf` and, when given, a custom warp whose
+    /// 16 control points are `pts`.
+    fn sold_with_warp(trnf: [f64; 8], pts: Option<&[[f64; 2]]>) -> Vec<u8> {
+        use photocraft_psd::descriptor::ObjectArray;
+        let e = |t: &str, v: &str| Value::Enumerated { type_id: Id::new(t), value: Id::new(v) };
+        let mut d = Descriptor::new("null")
+            .with("Idnt", Value::Text(UnicodeString::new_nul("uuid-1")))
+            .with("Trnf", Value::List(trnf.map(Value::Double).to_vec()))
+            .with("Sz  ", Value::Descriptor(Descriptor::new("Pnt ").with("Wdth", Value::Double(50.0)).with("Hght", Value::Double(25.0))));
+        if let Some(pts) = pts {
+            let bounds = Descriptor::new("Rctn")
+                .with("Top ", Value::Double(0.0))
+                .with("Left", Value::Double(0.0))
+                .with("Btom", Value::Double(25.0))
+                .with("Rght", Value::Double(50.0));
+            let mesh = Descriptor::new("null")
+                .with("Hrzn", Value::UnitFloats { unit: *b"#Pxl", values: pts.iter().map(|p| p[0]).collect() })
+                .with("Vrtc", Value::UnitFloats { unit: *b"#Pxl", values: pts.iter().map(|p| p[1]).collect() });
+            let warp = Descriptor::new("warp").with("warpStyle", e("warpStyle", "warpCustom")).with("bounds", Value::Descriptor(bounds)).with(
+                "customEnvelopeWarp",
+                Value::Descriptor(Descriptor::new("customEnvelopeWarp").with("meshPoints", Value::ObjectArray(ObjectArray { prefix: 16, body: mesh }))),
+            );
+            d = d.with("warp", Value::Descriptor(warp));
+        }
+        let mut data = b"soLD".to_vec();
+        data.extend_from_slice(&4u32.to_be_bytes());
+        data.extend(VersionedDescriptor::new(d).to_bytes());
+        data
+    }
+
+    /// Photoshop's `Trnf` is the image of the custom warp's control-point bounding box, not of the
+    /// source rect: a mesh spilling to x = -10, y = -5 and x = 60 frames a 70 × 30 box.
+    #[test]
+    fn smart_transform_maps_the_warp_control_box_onto_the_quad() {
+        let mut pts = photocraft_geom::warp::BezierMesh::identity([0.0, 0.0, 50.0, 25.0], 1, 1).points;
+        pts[0] = [-10.0, -5.0];
+        pts[15] = [60.0, 25.0];
+        let quad = [100.0, 200.0, 240.0, 200.0, 240.0, 260.0, 100.0, 260.0];
+        let (_, a) = parse_smart(b"SoLd", &sold_with_warp(quad, Some(&pts)));
+        assert_eq!(a.m, [2.0, 0.0, 0.0, 2.0, 120.0, 210.0]);
+        // Without a warp the source rect is the frame, as before.
+        assert_eq!(parse_smart(b"SoLd", &sold_with_warp(quad, None)).1.m, [2.8, 0.0, 0.0, 2.4, 100.0, 200.0]);
+    }
+
+    /// A custom mesh with no area (every control point on one spot) can't frame the quad: the
+    /// source rect does, with no division by zero.
+    #[test]
+    fn smart_transform_with_a_degenerate_warp_box_uses_the_source_rect() {
+        let quad = [100.0, 200.0, 240.0, 200.0, 240.0, 260.0, 100.0, 260.0];
+        let (_, a) = parse_smart(b"SoLd", &sold_with_warp(quad, Some(&[[7.0, 7.0]; 16])));
+        assert_eq!(a.m, [2.8, 0.0, 0.0, 2.4, 100.0, 200.0]);
+        let mut warp = photocraft_geom::warp::Warp::preset(photocraft_geom::warp::WarpStyle::Custom, 0.0, [0.0, 0.0, 50.0, 25.0]);
+        warp.mesh = Some(photocraft_geom::warp::BezierMesh { us: vec![0.0, 1.0], vs: vec![0.0, 1.0], points: vec![[f64::NAN, 1.0]; 16] });
+        assert_eq!(placed_frame(Some(&warp), 50.0, 25.0), [0.0, 0.0, 50.0, 25.0]);
+        assert_eq!(placed_frame(None, 50.0, 25.0), [0.0, 0.0, 50.0, 25.0]);
     }
 
     #[test]

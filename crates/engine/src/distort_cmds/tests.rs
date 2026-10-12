@@ -92,6 +92,17 @@ fn liquify_respects_the_selection() {
 }
 
 #[test]
+fn liquify_elapsed_time_is_wasm_safe() {
+    let mut s = session(8);
+    let r = s.execute(LIQUIFY, json!({"strokes": [{"tool": "forwardWarp", "size": 30, "points": [[30, 25], [42, 25]]}]})).unwrap();
+    assert_eq!(r["changed"], true);
+    let ms = r["ms"].as_f64().unwrap();
+    assert!(ms.is_finite() && ms >= 0.0);
+    #[cfg(target_arch = "wasm32")]
+    assert_eq!(ms, 0.0, "the web build uses the wasm-safe stopwatch fallback");
+}
+
+#[test]
 fn puppet_identity_translation_and_undo() {
     for depth in [8u64, 16, 32] {
         let mut s = session(depth);
@@ -114,6 +125,52 @@ fn puppet_identity_translation_and_undo() {
 }
 
 #[test]
+fn puppet_with_an_expansion_that_empties_the_mesh_keeps_the_layer() {
+    // #951: a pinned warp over an empty mesh panicked in the solver; it must not erase the layer
+    // either (the rasterizer keeps only pixels inside the mesh).
+    let mut s = session(8);
+    let before = active_surface(&s);
+    s.execute(PUPPET, json!({"pins": [{"src": [30, 25], "dst": [36, 29]}], "expansion": -200})).unwrap();
+    assert_eq!(active_surface(&s).read_region(Rect::new(0, 0, 80, 60)), before.read_region(Rect::new(0, 0, 80, 60)));
+}
+
+#[test]
+fn puppet_refuses_pins_that_stretch_the_content_too_far() {
+    // #1019: a pin dragged to (2^20, 2^20) stretched the mesh over ~17.6 million tiles, and the
+    // renderer allocated bookkeeping for every one before drawing anything.
+    let far = json!({"pins": [{"src": [20, 20], "dst": [20, 20]}, {"src": [50, 30], "dst": [1048576, 1048576]}]});
+    let full = Rect::new(0, 0, 80, 60);
+    for depth in [8u64, 16, 32] {
+        for selected in [false, true] {
+            let mut s = session(depth);
+            if selected {
+                s.execute("select.rect", json!({"x": 10, "y": 10, "width": 30, "height": 30})).unwrap();
+            }
+            let (before, past) = (active_surface(&s), s.active().unwrap().history.past_len());
+            let err = s.execute(PUPPET, far.clone()).unwrap_err();
+            assert!(err.to_string().contains("too far"), "{depth} {selected}: {err}");
+            assert_eq!(active_surface(&s).read_region(full), before.read_region(full), "{depth} {selected}: layer unchanged");
+            assert_eq!(s.active().unwrap().history.past_len(), past, "{depth} {selected}: no history step");
+        }
+        // Controls: a rigid move still moves the content, and a pin 4000 px out (well inside the
+        // budget) still warps.
+        let mut s = session(depth);
+        s.execute(PUPPET, json!({"pins": [{"src": [20, 20], "dst": [30, 25]}, {"src": [50, 30], "dst": [60, 35]}], "mode": "rigid"})).unwrap();
+        assert_eq!(active_surface(&s).content_bounds(), Rect::new(20, 15, 70, 45), "{depth}");
+        let mut s = session(depth);
+        s.execute(PUPPET, json!({"pins": [{"src": [20, 20], "dst": [20, 20]}, {"src": [50, 30], "dst": [4050, 4030]}]})).unwrap();
+        assert!(active_surface(&s).content_bounds().x1 > 1000, "{depth}");
+    }
+    // A smart object stores the filter; a warp too far to render leaves its pixels as they were.
+    let mut s = session(8);
+    s.execute("layer.smartObjects.convertToSmartObject", json!({})).unwrap();
+    let before = active_surface(&s);
+    s.execute(PUPPET_SMART, far).unwrap();
+    assert_eq!(smart(&s).smart_filters.len(), 1);
+    assert_eq!(active_surface(&s), before);
+}
+
+#[test]
 fn puppet_two_pins_bend_the_block() {
     let mut s = session(8);
     // Hold the left end, lift the right end: the right side rises, the left stays.
@@ -121,6 +178,42 @@ fn puppet_two_pins_bend_the_block() {
     let after = active_surface(&s);
     assert!(after.pixel(12, 25)[3] > 0.5, "the held end stays");
     assert!(after.content_bounds().y0 < 6, "{:?}", after.content_bounds());
+}
+
+#[test]
+fn puppet_mesh_follows_the_outline_so_separate_shapes_move_separately() {
+    // #3105: the mesh was every grid cell touching opaque pixels, so two bars 24 px apart (more
+    // than a mesh cell at Fewer Points) shared cells and a pin on one dragged the other along.
+    // The mesh now follows the outline grown by the expansion: two meshes, and the unpinned one
+    // stays put.
+    for depth in [8u64, 16, 32] {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 260, "height": 140, "depth": depth})).unwrap();
+        s.execute("layer.new.layer", json!({})).unwrap();
+        s.edit("paint", |doc, active| {
+            let surf = doc.layer_mut(active.unwrap()).unwrap().surface_mut().unwrap();
+            for (y0, y1) in [(20, 60), (84, 120)] {
+                for y in y0..y1 {
+                    for x in 10..250 {
+                        let v = ((x / 4 + y / 4) % 2) as f32;
+                        surf.write_pixel(x, y, &[v, 1.0 - v, (y as f32) / 140.0, 1.0]);
+                    }
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        let before = active_surface(&s);
+        s.execute(PUPPET, json!({"pins": [{"src": [130, 40], "dst": [130, 30]}], "density": "fewer", "expansion": 2, "interpolation": "bilinear"})).unwrap();
+        let after = active_surface(&s).convert(before.format());
+        let lower = Rect::new(0, 70, 260, 140);
+        let still = worst(&after, &before, lower);
+        assert!(still <= 1.0 / 255.0, "{depth}: the unpinned bar stays ({still})");
+        assert!(
+            worst(&after, &photocraft_algo::resample::translate_surface(&before, 0, -10), Rect::new(0, 0, 260, 60)) <= 1.0 / 255.0,
+            "{depth}: the pinned bar moves"
+        );
+    }
 }
 
 #[test]
@@ -156,6 +249,42 @@ fn perspective_identity_known_homography_and_mask() {
     assert!(s.execute(PERSPECTIVE, json!({})).is_err());
     assert!(s.execute(PERSPECTIVE, json!({"planes": [{"src": [[0, 0], [0, 0], [0, 0], [0, 0]], "dst": [[0, 0], [0, 0], [0, 0], [0, 0]]}]})).is_err());
     assert!(s.execute(PERSPECTIVE, json!({"planes": [{"src": q, "dst": d}], "straighten": "sideways"})).is_err());
+}
+
+#[test]
+fn perspective_with_a_selection_moves_only_the_selected_part_of_a_linked_mask() {
+    // #3083: the mask hides a stripe inside the selection (x 12..16) and one outside it (x 40..44).
+    let mask_at = |s: &Session, x, y| {
+        let st = s.active().unwrap();
+        st.doc.layer(st.active_layer.unwrap()).unwrap().mask.as_ref().unwrap().surface.sample_channel(x, y, 0)
+    };
+    for selected in [true, false] {
+        let mut s = session(8);
+        s.execute("layer.layerMask.revealAll", json!({})).unwrap();
+        s.edit("mask", |doc, active| {
+            let m = doc.layer_mut(active.unwrap()).unwrap().mask.as_mut().unwrap();
+            m.surface.fill_rect(Rect::new(12, 10, 16, 40), &[0.0]);
+            m.surface.fill_rect(Rect::new(40, 10, 44, 40), &[0.0]);
+            Ok(())
+        })
+        .unwrap();
+        if selected {
+            s.execute("select.rect", json!({"x": 0, "y": 0, "width": 30, "height": 60})).unwrap();
+        }
+        let q = [[0.0, 0.0], [30.0, 0.0], [30.0, 60.0], [0.0, 60.0]];
+        let d = q.map(|p| [p[0] + 4.0, p[1]]);
+        s.execute(PERSPECTIVE, json!({"planes": [{"src": q, "dst": d}], "interpolation": "bilinear"})).unwrap();
+        // The selected stripe moves with the pixels either way.
+        assert!(mask_at(&s, 17, 25) < 0.01 && mask_at(&s, 13, 25) > 0.99, "selected={selected}");
+        if selected {
+            // The unselected stripe stays over the unselected pixels.
+            assert!(mask_at(&s, 43, 25) < 0.01 && mask_at(&s, 47, 25) > 0.99);
+            assert_eq!(active_surface(&s).pixel(43, 25)[3], 1.0);
+        } else {
+            // Without a selection the whole mask moves with the layer.
+            assert!(mask_at(&s, 47, 25) < 0.01 && mask_at(&s, 43, 25) > 0.99);
+        }
+    }
 }
 
 #[test]
@@ -208,4 +337,18 @@ fn background_layer_is_floated_by_geometric_warps() {
     assert_eq!(l.name, "Layer 0");
     assert!(l.surface().unwrap().format().alpha);
     assert!(l.surface().unwrap().pixel(2, 15)[3] < 0.01, "exposed area is transparent");
+}
+
+#[test]
+fn liquify_with_a_far_off_stroke_point_returns() {
+    // #937: the issue's request walked ~3.3e14 dab steps along a segment to (1e15, 0).
+    for depth in [8u64, 16, 32] {
+        let mut s = session(depth);
+        let r = s.execute(LIQUIFY, json!({"strokes": [{"tool": "forwardWarp", "size": 30, "points": [[0, 0], [1e15, 0]]}]})).unwrap();
+        assert_eq!(r["changed"], true, "{depth}: the start of the stroke is on the canvas");
+        let mut s = session(depth);
+        let before = active_surface(&s);
+        s.execute(LIQUIFY, json!({"strokes": [{"tool": "bloat", "size": 30, "points": [[5000, 5000], [1e15, 1e15]]}]})).unwrap();
+        assert_eq!(active_surface(&s).read_region(Rect::new(0, 0, 80, 60)), before.read_region(Rect::new(0, 0, 80, 60)), "{depth}: off-canvas only");
+    }
 }

@@ -189,7 +189,7 @@ fn default_true() -> bool {
 }
 
 /// Byte length of the mask parameter values announced by the parameter flags byte `pf`.
-fn mask_parameter_bytes(pf: u8) -> usize {
+pub(crate) fn mask_parameter_bytes(pf: u8) -> usize {
     usize::from(pf & 1 != 0) + 8 * usize::from(pf & 2 != 0) + usize::from(pf & 4 != 0) + 8 * usize::from(pf & 8 != 0)
 }
 
@@ -214,11 +214,31 @@ impl LayerMask {
 
     /// Whether `d` (a whole mask record with mask parameters) stores the real-mask fields before
     /// the parameters, as Photoshop does. The spec's order wins when it reads as parameters
-    /// followed by padding alone (no real mask), the one layout the two orders can share.
-    fn real_before_parameters(d: &[u8]) -> bool {
+    /// followed by padding alone (no real mask), the one layout the two orders can share. When
+    /// both orders fit the record's length, Photoshop's is taken unless its reading is
+    /// implausible (a real-mask background that is neither 0 nor 255, or parameter flag bits
+    /// the spec does not define) while the spec's reading with a real mask is sound.
+    pub(crate) fn real_before_parameters(d: &[u8]) -> bool {
+        // Parameters at `pf_at`, then 0..=3 bytes of padding, and nothing else.
         let fits =
             |pf_at: usize| d.get(pf_at).is_some_and(|&pf| (pf_at + 1 + mask_parameter_bytes(pf)..=pf_at + 4 + mask_parameter_bytes(pf)).contains(&d.len()));
-        !fits(18) && fits(36)
+        if fits(18) {
+            return false;
+        }
+        let photoshop = fits(36);
+        if !photoshop {
+            return false;
+        }
+        let known_flags = |pf: u8| pf & 0xF0 == 0;
+        let real_background_ok = |at: usize| d.get(at + 1).is_some_and(|&bg| bg == 0 || bg == 255);
+        // Photoshop's reading: real-mask fields at 18, parameters at 36.
+        let photoshop_plausible = real_background_ok(18) && d.get(36).is_some_and(|&pf| known_flags(pf));
+        // The spec's reading: parameters at 18, then the 18 real-mask bytes, then padding.
+        let spec_plausible = d.get(18).is_some_and(|&pf| {
+            let real_at = 19 + mask_parameter_bytes(pf);
+            known_flags(pf) && (real_at + 18..=real_at + 21).contains(&d.len()) && real_background_ok(real_at)
+        });
+        photoshop_plausible || !spec_plausible
     }
 
     fn parse(d: &[u8]) -> Result<Self> {
@@ -591,7 +611,7 @@ impl LayerRecord {
         out.put_len(self.blending_ranges.data.len() as u64, false)?;
         out.put(&self.blending_ranges.data);
         write_pascal(out, &self.name, 4);
-        write_blocks(out, &self.blocks, version)?;
+        write_blocks(out, &self.blocks, version, 2)?;
         out.put(&self.extra_trailing);
         out.end_len(at, false)
     }
@@ -664,15 +684,25 @@ impl LayerInfo {
     /// block in 4-byte units (psd-tools) misread the blocks after a body that
     /// is only padded to even.
     pub fn pad_to(&mut self, version: Version, align: u64) -> Result<()> {
-        let align = align.max(1);
-        let len = self.unpadded_len(version)?;
-        self.padding = Some(vec![0; ((align - len % align) % align) as usize]);
+        self.padding = Some(vec![0; self.pad_len(version, align)?]);
         Ok(())
     }
 
-    /// Serializes the body (without a length field).
-    pub(crate) fn write_body(&self, out: &mut Vec<u8>, version: Version) -> Result<()> {
-        let start = out.len();
+    /// Number of zero bytes [`Self::pad_to`] would set, without touching `self`.
+    pub(crate) fn pad_len(&self, version: Version, align: u64) -> Result<usize> {
+        let align = align.max(1);
+        let len = self.unpadded_len(version)?;
+        Ok(((align - len % align) % align) as usize)
+    }
+
+    /// Bytes of channel data and their compression fields: the part of the body worth reserving up
+    /// front (the records are small next to the pixels). Saturates instead of overflowing.
+    pub(crate) fn channel_data_len(&self) -> usize {
+        self.layers.iter().flat_map(|l| &l.channels).filter(|c| c.compression.is_some()).fold(0usize, |n, c| n.saturating_add(2).saturating_add(c.data.len()))
+    }
+
+    /// Serializes the body without any trailing padding (the padding field is ignored).
+    pub(crate) fn write_unpadded(&self, out: &mut Vec<u8>, version: Version) -> Result<()> {
         let n = i16::try_from(self.layers.len()).map_err(|_| PsdError::LimitExceeded("more than 32767 layers"))?;
         out.put_i16(if self.merged_alpha { -n } else { n });
         for l in &self.layers {
@@ -686,6 +716,13 @@ impl LayerInfo {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Serializes the body (without a length field).
+    pub(crate) fn write_body(&self, out: &mut Vec<u8>, version: Version) -> Result<()> {
+        let start = out.len();
+        self.write_unpadded(out, version)?;
         match &self.padding {
             Some(p) => out.put(p),
             None => {
@@ -845,6 +882,45 @@ mod tests {
         assert_eq!(out, d);
     }
 
+    /// A density-only record in the spec's order (#949): the parameter flags byte at 18 says one
+    /// value byte, so the spec's reading excludes the 38-byte length only if the real mask is
+    /// ignored, while byte 36 (inside the real rectangle's `right`) is 0 and makes Photoshop's
+    /// reading fit too. Photoshop's reading puts the density (64) where a 0-or-255 background
+    /// belongs, so the spec's order wins and the density survives.
+    #[test]
+    fn density_only_spec_layout_is_not_read_as_photoshop_order() {
+        for (density, right) in [(64u8, 1u32), (200, 1), (64, 300), (1, 7)] {
+            let mut d = Vec::new();
+            Rect::from_xywh(0, 0, 1, 1).write(&mut d);
+            d.extend([255, LayerMask::FLAG_PARAMETERS]);
+            d.extend([0b0001, density]);
+            d.extend([0, 0]);
+            Rect::from_xywh(0, 0, right, 1).write(&mut d);
+            let m = LayerMask::parse(&d).unwrap();
+            assert!(!m.real_first, "density {density}, right {right}: {m:?}");
+            assert_eq!(m.parameters.unwrap().user_density, Some(density));
+            assert_eq!(m.real, Some(RealMask { flags: 0, background: 0, rect: Rect::from_xywh(0, 0, right, 1) }));
+            assert!(m.trailing.is_empty());
+            let mut out = Vec::new();
+            m.write(&mut out);
+            assert_eq!(out, d);
+        }
+        // Photoshop's order with the same lengths still reads as Photoshop's order.
+        let mut d = Vec::new();
+        Rect::from_xywh(0, 0, 1, 1).write(&mut d);
+        d.extend([255, LayerMask::FLAG_PARAMETERS]);
+        d.extend([0, 255]);
+        Rect::from_xywh(0, 0, 1, 1).write(&mut d);
+        d.extend([0b0001, 64]);
+        let m = LayerMask::parse(&d).unwrap();
+        assert!(m.real_first, "{m:?}");
+        assert_eq!(m.parameters.unwrap().user_density, Some(64));
+        assert_eq!(m.real.map(|r| r.background), Some(255));
+        let mut out = Vec::new();
+        m.write(&mut out);
+        assert_eq!(out, d);
+    }
+
     /// The spec's order (parameters, then real fields) still parses and stays byte-stable.
     #[test]
     fn real_mask_after_parameters_spec_layout() {
@@ -961,6 +1037,37 @@ mod tests {
         let info = LayerInfo { layers: vec![rec], ..Default::default() };
         rt(&info, Version::Psd);
         assert_eq!(info.layers[0].decode_channel(0, 8, Version::Psd).unwrap(), Vec::<u8>::new());
+    }
+
+    /// Padding without cloning the layers writes the same bytes as `pad_to` on a clone, and the
+    /// channel data length hint is exact.
+    #[test]
+    fn unpadded_write_matches_pad_to_on_a_clone() {
+        use crate::{ColorMode, Compression, testgen};
+        for version in [Version::Psd, Version::Psb] {
+            for depth in [8u16, 16, 32] {
+                for compression in [Compression::Raw, Compression::Rle] {
+                    let file = testgen::layered(version, ColorMode::Rgb, depth, compression);
+                    let mut info = file.layer_info.clone().unwrap();
+                    for align in [1u64, 2, 4, 8] {
+                        let mut cloned = info.clone();
+                        cloned.pad_to(version, align).unwrap();
+                        let mut want = Vec::new();
+                        cloned.write_body(&mut want, version).unwrap();
+                        let pad = info.pad_len(version, align).unwrap();
+                        let mut got = Vec::new();
+                        info.write_unpadded(&mut got, version).unwrap();
+                        assert!(got.len() >= info.channel_data_len());
+                        got.resize(got.len() + pad, 0);
+                        assert_eq!(got, want, "{version:?} {depth} {compression:?} align {align}");
+                    }
+                    info.padding = Some(vec![7, 7]);
+                    let mut with_padding = Vec::new();
+                    info.write_body(&mut with_padding, version).unwrap();
+                    assert!(with_padding.ends_with(&[7, 7]));
+                }
+            }
+        }
     }
 
     #[test]
